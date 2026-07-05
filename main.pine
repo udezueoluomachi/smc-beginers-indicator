@@ -1,0 +1,635 @@
+// @version=5
+indicator("SMC/ICT Entry Marker - BOS/CHoCH/OB/FVG/Liquidity", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+g_htf      = "HTF Bias"
+g_struct   = "Structure"
+g_ob       = "Order Blocks"
+g_fvg      = "Fair Value Gaps"
+g_liq      = "Liquidity"
+g_entry    = "Entry Logic"
+
+htfRes1     = input.timeframe("D",  "Top HTF Timeframe (e.g. Daily)", group=g_htf)
+midRes      = input.timeframe("240", "Mid HTF Timeframe (e.g. 4H)", group=g_htf)
+useHTF      = input.bool(true, "Require Top HTF bias alignment", group=g_htf)
+useMidHTF   = input.bool(true, "Require Mid HTF bias alignment too", group=g_htf)
+
+g_vol = "Volatility / Robustness"
+useVolFilter   = input.bool(true, "Filter out dead / spike volatility regimes", group=g_vol)
+volLowPct      = input.float(40.0, "Skip if ATR% below this % of its own average (illiquid)", minval=0, maxval=100, group=g_vol)
+volHighPct     = input.float(250.0, "Skip if ATR% above this % of its own average (news spike)", minval=100, group=g_vol)
+volLookback    = input.int(100, "Volatility regime lookback (bars)", minval=20, group=g_vol)
+adaptiveSwing  = input.bool(true, "Auto-scale swing length to volatility", group=g_vol)
+
+swingLen    = input.int(5, "Swing Lookback (bars each side)", minval=2, group=g_struct)
+
+obLookback  = input.int(15, "OB search lookback (bars)", minval=3, group=g_ob)
+impulseMult = input.float(1.5, "Impulse strength (x avg body)", minval=1.0, step=0.1, group=g_ob)
+obMaxAge    = input.int(150, "Max OB age (bars) before removal", minval=10, group=g_ob)
+maxOBsPerSide = input.int(3, "Max active OBs shown per side", minval=1, maxval=10, group=g_ob)
+showOBBoxes = input.bool(true, "Show OB boxes on chart", group=g_ob)
+
+fvgMinSizeATR = input.float(0.1, "Min FVG size (x ATR)", minval=0.0, step=0.05, group=g_fvg)
+fvgMaxAge   = input.int(100, "Max FVG age (bars)", minval=10, group=g_fvg)
+maxFVGsPerSide = input.int(3, "Max active FVGs shown per side", minval=1, maxval=10, group=g_fvg)
+showFVGBoxes = input.bool(true, "Show FVG boxes on chart", group=g_fvg)
+
+eqTolATR    = input.float(0.1, "Equal High/Low tolerance (x ATR)", minval=0.0, step=0.05, group=g_liq)
+
+requireSweep = input.bool(false, "Require liquidity sweep before entry", group=g_entry)
+requireFVGorOB = input.bool(true, "Require LTF OB or FVG at entry candle", group=g_entry)
+maxRiskPerc  = input.float(1.0, "Risk % per trade (for SL/TP label sizing only)", minval=0.1, group=g_entry)
+rrTarget     = input.float(2.0, "Minimum R:R target", minval=1.0, group=g_entry)
+
+showSetupLabels = input.bool(true, "Show SETUP READY labels (pending entries)", group=g_entry)
+
+// ============================================================================
+// ATR for size filters
+// ============================================================================
+atr14 = ta.atr(14)
+
+// ============================================================================
+// VOLATILITY REGIME
+// ============================================================================
+atrPct       = (atr14 / close) * 100
+atrPctAvg    = ta.sma(atrPct, volLookback)
+atrPctRatio  = atrPctAvg > 0 ? (atrPct / atrPctAvg) * 100 : 100
+volRegimeOK  = not useVolFilter or (atrPctRatio >= volLowPct and atrPctRatio <= volHighPct)
+
+effSwingLen = adaptiveSwing ? int(math.max(3, math.min(12, swingLen * (atrPctRatio / 100)))) : swingLen
+
+// ============================================================================
+// SWING HIGH / LOW DETECTION
+// ============================================================================
+swHigh = ta.pivothigh(high, effSwingLen, effSwingLen)
+swLow  = ta.pivotlow(low, effSwingLen, effSwingLen)
+
+var float lastSwingHigh = na
+var float lastSwingHigh2 = na
+var float lastSwingLow  = na
+var float lastSwingLow2 = na
+var int   lastSwingHighBar = na
+var int   lastSwingLowBar  = na
+
+if not na(swHigh)
+    lastSwingHigh2 := lastSwingHigh
+    lastSwingHigh  := swHigh
+    lastSwingHighBar := bar_index - effSwingLen
+if not na(swLow)
+    lastSwingLow2 := lastSwingLow
+    lastSwingLow  := swLow
+    lastSwingLowBar := bar_index - effSwingLen
+
+// ============================================================================
+// MARKET STRUCTURE: trend state + BOS/CHoCH
+// ============================================================================
+var int trendState = 0
+var bool bosUp = false
+var bool bosDown = false
+var bool chochUp = false
+var bool chochDown = false
+
+bosUp := false
+bosDown := false
+chochUp := false
+chochDown := false
+
+if not na(lastSwingHigh) and close > lastSwingHigh and close[1] <= lastSwingHigh
+    if trendState == 1 or trendState == 0
+        bosUp := true
+        trendState := 1
+        if not na(lastSwingHighBar)
+            line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh, color=color.lime, width=2, style=line.style_solid)
+    else
+        chochUp := true
+        trendState := 1
+        if not na(lastSwingHighBar)
+            line.new(lastSwingHighBar, lastSwingHigh, bar_index, lastSwingHigh, color=color.aqua, width=2, style=line.style_dashed)
+
+if not na(lastSwingLow) and close < lastSwingLow and close[1] >= lastSwingLow
+    if trendState == -1 or trendState == 0
+        bosDown := true
+        trendState := -1
+        if not na(lastSwingLowBar)
+            line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow, color=color.red, width=2, style=line.style_solid)
+    else
+        chochDown := true
+        trendState := -1
+        if not na(lastSwingLowBar)
+            line.new(lastSwingLowBar, lastSwingLow, bar_index, lastSwingLow, color=color.orange, width=2, style=line.style_dashed)
+
+plotshape(bosUp,   title="BOS Up",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime, 20),   size=size.tiny, text="BOS")
+plotshape(bosDown, title="BOS Down", style=shape.triangledown, location=location.abovebar, color=color.new(color.red, 20),     size=size.tiny, text="BOS")
+plotshape(chochUp,   title="CHoCH Up",   style=shape.triangleup,   location=location.belowbar, color=color.new(color.aqua, 0),   size=size.tiny, text="CHoCH", textcolor=color.aqua)
+plotshape(chochDown, title="CHoCH Down", style=shape.triangledown, location=location.abovebar, color=color.new(color.orange, 0), size=size.tiny, text="CHoCH", textcolor=color.orange)
+
+// ============================================================================
+// HTF BIAS
+// ============================================================================
+getHTFBias() =>
+    hSwHigh = ta.pivothigh(high, swingLen, swingLen)
+    hSwLow  = ta.pivotlow(low, swingLen, swingLen)
+    var float hLastHigh = na
+    var float hLastLow  = na
+    var int hTrend = 0
+    if not na(hSwHigh)
+        hLastHigh := hSwHigh
+    if not na(hSwLow)
+        hLastLow := hSwLow
+    if not na(hLastHigh) and close > hLastHigh
+        hTrend := 1
+    if not na(hLastLow) and close < hLastLow
+        hTrend := -1
+    hTrend
+
+htfBias = request.security(syminfo.tickerid, htfRes1, getHTFBias(), lookahead=barmerge.lookahead_off)
+midBias = request.security(syminfo.tickerid, midRes,  getHTFBias(), lookahead=barmerge.lookahead_off)
+
+bgcolor(useHTF and htfBias == 1 ? color.new(color.green, 95) : useHTF and htfBias == -1 ? color.new(color.red, 95) : na, title="HTF Bias Background")
+
+// ============================================================================
+// ORDER BLOCKS
+// ============================================================================
+avgBody = ta.sma(math.abs(close - open), obLookback)
+isBullCandle = close > open
+isBearCandle = close < open
+bodySize = math.abs(close - open)
+isImpulseUp   = isBullCandle and bodySize > avgBody * impulseMult
+isImpulseDown = isBearCandle and bodySize > avgBody * impulseMult
+
+var box[] bullOBs = array.new<box>()
+var box[] bearOBs = array.new<box>()
+var float[] bullOBTop = array.new<float>()
+var float[] bullOBBot = array.new<float>()
+var int[]   bullOBBarStart = array.new<int>()
+var float[] bearOBTop = array.new<float>()
+var float[] bearOBBot = array.new<float>()
+var int[]   bearOBBarStart = array.new<int>()
+
+capArray(boxes, tops, bots, starts, maxCount) =>
+    while array.size(boxes) > maxCount
+        box.delete(array.get(boxes, 0))
+        array.remove(boxes, 0)
+        array.remove(tops, 0)
+        array.remove(bots, 0)
+        array.remove(starts, 0)
+
+obBoxColor   = showOBBoxes ? color.new(color.lime, 85) : color.new(color.lime, 100)
+obBoxColorB  = showOBBoxes ? color.new(color.red, 85)  : color.new(color.red, 100)
+obBorderBull = showOBBoxes ? color.new(color.lime, 0)  : color.new(color.lime, 100)
+obBorderBear = showOBBoxes ? color.new(color.red, 0)   : color.new(color.red, 100)
+
+if array.size(bullOBTop) > 0
+    i = array.size(bullOBs) - 1
+    while i >= 0
+        if close < array.get(bullOBBot, i)
+            box.delete(array.get(bullOBs, i))
+            array.remove(bullOBs, i)
+            array.remove(bullOBTop, i)
+            array.remove(bullOBBot, i)
+            array.remove(bullOBBarStart, i)
+        i -= 1
+
+if array.size(bearOBTop) > 0
+    i = array.size(bearOBs) - 1
+    while i >= 0
+        if close > array.get(bearOBTop, i)
+            box.delete(array.get(bearOBs, i))
+            array.remove(bearOBs, i)
+            array.remove(bearOBTop, i)
+            array.remove(bearOBBot, i)
+            array.remove(bearOBBarStart, i)
+        i -= 1
+
+if isImpulseUp
+    idx = 1
+    found = false
+    while idx <= obLookback and not found
+        if close[idx] < open[idx]
+            obTop = open[idx]
+            obBot = close[idx]
+            b = box.new(bar_index[idx], math.max(obTop, obBot), bar_index, math.min(obTop, obBot), border_color=obBorderBull, bgcolor=obBoxColor, text="BUY ZONE (Order Block)\nWait for price here, then look to LONG", text_size=size.tiny, text_color=showOBBoxes ? color.new(color.white,10) : color.new(color.white,100), text_halign=text.align_left, text_valign=text.align_top)
+            array.push(bullOBs, b)
+            array.push(bullOBTop, math.max(obTop, obBot))
+            array.push(bullOBBot, math.min(obTop, obBot))
+            array.push(bullOBBarStart, bar_index[idx])
+            capArray(bullOBs, bullOBTop, bullOBBot, bullOBBarStart, maxOBsPerSide)
+            found := true
+        idx += 1
+
+if isImpulseDown
+    idx = 1
+    found = false
+    while idx <= obLookback and not found
+        if close[idx] > open[idx]
+            obTop = close[idx]
+            obBot = open[idx]
+            b = box.new(bar_index[idx], math.max(obTop, obBot), bar_index, math.min(obTop, obBot), border_color=obBorderBear, bgcolor=obBoxColorB, text="SELL ZONE (Order Block)\nWait for price here, then look to SHORT", text_size=size.tiny, text_color=showOBBoxes ? color.new(color.white,10) : color.new(color.white,100), text_halign=text.align_left, text_valign=text.align_top)
+            array.push(bearOBs, b)
+            array.push(bearOBTop, math.max(obTop, obBot))
+            array.push(bearOBBot, math.min(obTop, obBot))
+            array.push(bearOBBarStart, bar_index[idx])
+            capArray(bearOBs, bearOBTop, bearOBBot, bearOBBarStart, maxOBsPerSide)
+            found := true
+        idx += 1
+
+manageOBs(boxes, tops, bots, starts) =>
+    i = array.size(boxes) - 1
+    while i >= 0
+        b = array.get(boxes, i)
+        box.set_right(b, bar_index)
+        if bar_index - array.get(starts, i) > obMaxAge
+            box.delete(b)
+            array.remove(boxes, i)
+            array.remove(tops, i)
+            array.remove(bots, i)
+            array.remove(starts, i)
+        i -= 1
+
+manageOBs(bullOBs, bullOBTop, bullOBBot, bullOBBarStart)
+manageOBs(bearOBs, bearOBTop, bearOBBot, bearOBBarStart)
+
+priceInBullOB() =>
+    found = false
+    if array.size(bullOBTop) > 0
+        for i = 0 to array.size(bullOBTop) - 1
+            if low <= array.get(bullOBTop, i) and high >= array.get(bullOBBot, i)
+                found := true
+    found
+
+priceInBearOB() =>
+    found = false
+    if array.size(bearOBTop) > 0
+        for i = 0 to array.size(bearOBTop) - 1
+            if high >= array.get(bearOBBot, i) and low <= array.get(bearOBTop, i)
+                found := true
+    found
+
+// ============================================================================
+// FAIR VALUE GAPS
+// ============================================================================
+var box[] bullFVGs = array.new<box>()
+var float[] bullFVGTop = array.new<float>()
+var float[] bullFVGBot = array.new<float>()
+var int[]   bullFVGStart = array.new<int>()
+var box[] bearFVGs = array.new<box>()
+var float[] bearFVGTop = array.new<float>()
+var float[] bearFVGBot = array.new<float>()
+var int[]   bearFVGStart = array.new<int>()
+
+bullFVGCond = low > high[2] and (low - high[2]) > atr14 * fvgMinSizeATR
+bearFVGCond = high < low[2] and (low[2] - high) > atr14 * fvgMinSizeATR
+
+fvgBoxColorBull = showFVGBoxes ? color.new(color.blue, 88) : color.new(color.blue, 100)
+fvgBoxColorBear = showFVGBoxes ? color.new(color.fuchsia, 88) : color.new(color.fuchsia, 100)
+fvgBorderBull   = showFVGBoxes ? color.new(color.blue, 0) : color.new(color.blue, 100)
+fvgBorderBear   = showFVGBoxes ? color.new(color.fuchsia, 0) : color.new(color.fuchsia, 100)
+
+if array.size(bullFVGTop) > 0
+    i = array.size(bullFVGs) - 1
+    while i >= 0
+        if close < array.get(bullFVGBot, i)
+            box.delete(array.get(bullFVGs, i))
+            array.remove(bullFVGs, i)
+            array.remove(bullFVGTop, i)
+            array.remove(bullFVGBot, i)
+            array.remove(bullFVGStart, i)
+        i -= 1
+
+if array.size(bearFVGTop) > 0
+    i = array.size(bearFVGs) - 1
+    while i >= 0
+        if close > array.get(bearFVGTop, i)
+            box.delete(array.get(bearFVGs, i))
+            array.remove(bearFVGs, i)
+            array.remove(bearFVGTop, i)
+            array.remove(bearFVGBot, i)
+            array.remove(bearFVGStart, i)
+        i -= 1
+
+if bullFVGCond
+    top = low
+    bot = high[2]
+    b = box.new(bar_index[2], top, bar_index, bot, border_color=fvgBorderBull, bgcolor=fvgBoxColorBull, text="BUY ZONE (Fair Value Gap)\nPrice often returns here before continuing up", text_size=size.tiny, text_color=showFVGBoxes ? color.new(color.white,10) : color.new(color.white,100), text_halign=text.align_left, text_valign=text.align_bottom)
+    array.push(bullFVGs, b)
+    array.push(bullFVGTop, top)
+    array.push(bullFVGBot, bot)
+    array.push(bullFVGStart, bar_index[2])
+    capArray(bullFVGs, bullFVGTop, bullFVGBot, bullFVGStart, maxFVGsPerSide)
+
+if bearFVGCond
+    top = low[2]
+    bot = high
+    b = box.new(bar_index[2], top, bar_index, bot, border_color=fvgBorderBear, bgcolor=fvgBoxColorBear, text="SELL ZONE (Fair Value Gap)\nPrice often returns here before continuing down", text_size=size.tiny, text_color=showFVGBoxes ? color.new(color.white,10) : color.new(color.white,100), text_halign=text.align_left, text_valign=text.align_top)
+    array.push(bearFVGs, b)
+    array.push(bearFVGTop, top)
+    array.push(bearFVGBot, bot)
+    array.push(bearFVGStart, bar_index[2])
+    capArray(bearFVGs, bearFVGTop, bearFVGBot, bearFVGStart, maxFVGsPerSide)
+
+manageOBs(bullFVGs, bullFVGTop, bullFVGBot, bullFVGStart)
+manageOBs(bearFVGs, bearFVGTop, bearFVGBot, bearFVGStart)
+
+priceInBullFVG() =>
+    found = false
+    if array.size(bullFVGTop) > 0
+        for i = 0 to array.size(bullFVGTop) - 1
+            if low <= array.get(bullFVGTop, i) and high >= array.get(bullFVGBot, i)
+                found := true
+    found
+
+priceInBearFVG() =>
+    found = false
+    if array.size(bearFVGTop) > 0
+        for i = 0 to array.size(bearFVGTop) - 1
+            if high >= array.get(bearFVGBot, i) and low <= array.get(bearFVGTop, i)
+                found := true
+    found
+
+// ============================================================================
+// LIQUIDITY SWEEPS
+// ============================================================================
+eqTol = atr14 * eqTolATR
+
+sweptHigh = not na(lastSwingHigh) and high > lastSwingHigh and close < lastSwingHigh and (high - lastSwingHigh) <= eqTol * 3
+sweptLow  = not na(lastSwingLow)  and low  < lastSwingLow  and close > lastSwingLow  and (lastSwingLow - low) <= eqTol * 3
+
+plotshape(sweptHigh, title="Liquidity Sweep High", style=shape.xcross, location=location.abovebar, color=color.new(color.red, 20), size=size.tiny)
+plotshape(sweptLow,  title="Liquidity Sweep Low",  style=shape.xcross, location=location.belowbar, color=color.new(color.lime, 20), size=size.tiny)
+
+var bool recentSweepLow  = false
+var bool recentSweepHigh = false
+var int sweepLowBar = na
+var int sweepHighBar = na
+
+if sweptLow
+    recentSweepLow := true
+    sweepLowBar := bar_index
+if sweptHigh
+    recentSweepHigh := true
+    sweepHighBar := bar_index
+
+if recentSweepLow and bar_index - sweepLowBar > 20
+    recentSweepLow := false
+if recentSweepHigh and bar_index - sweepHighBar > 20
+    recentSweepHigh := false
+
+// ============================================================================
+// PREMIUM / DISCOUNT
+// ============================================================================
+rangeHigh = ta.highest(high, obLookback * 2)
+rangeLow  = ta.lowest(low, obLookback * 2)
+midpoint  = (rangeHigh + rangeLow) / 2
+inDiscount = close < midpoint
+inPremium  = close > midpoint
+
+// ============================================================================
+// ENTRY LOGIC
+// ============================================================================
+htfOKLong  = (not useHTF or htfBias == 1) and (not useMidHTF or midBias == 1)
+htfOKShort = (not useHTF or htfBias == -1) and (not useMidHTF or midBias == -1)
+
+poiLong  = priceInBullOB() or priceInBullFVG()
+poiShort = priceInBearOB() or priceInBearFVG()
+
+structOKLong  = chochUp or bosUp
+structOKShort = chochDown or bosDown
+
+sweepOKLong  = not requireSweep or recentSweepLow
+sweepOKShort = not requireSweep or recentSweepHigh
+
+poiReqLong  = not requireFVGorOB or poiLong
+poiReqShort = not requireFVGorOB or poiShort
+
+longSignal  = htfOKLong  and inDiscount and structOKLong  and poiReqLong  and sweepOKLong  and volRegimeOK
+shortSignal = htfOKShort and inPremium  and structOKShort and poiReqShort and sweepOKShort and volRegimeOK
+
+var bool wasLong = false
+var bool wasShort = false
+fireLong  = longSignal and not wasLong
+fireShort = shortSignal and not wasShort
+wasLong := longSignal
+wasShort := shortSignal
+
+// ============================================================================
+// SETUP DETECTION (Pending Entries)
+// ============================================================================
+// Setup is ready when: HTF aligned + structure formed + POI exists in right zone
+// But price hasn't tapped it yet
+
+hasBullPOI = array.size(bullOBTop) > 0 or array.size(bullFVGTop) > 0
+hasBearPOI = array.size(bearOBTop) > 0 or array.size(bearFVGTop) > 0
+
+setupLongReady = htfOKLong and (bosUp or chochUp) and inDiscount and hasBullPOI and volRegimeOK and not poiLong
+setupShortReady = htfOKShort and (bosDown or chochDown) and inPremium and hasBearPOI and volRegimeOK and not poiShort
+
+var bool wasSetupLong = false
+var bool wasSetupShort = false
+fireSetupLong = setupLongReady and not wasSetupLong
+fireSetupShort = setupShortReady and not wasSetupShort
+wasSetupLong := setupLongReady
+wasSetupShort := setupShortReady
+
+// ============================================================================
+// PLOT ENTRY SIGNALS WITH SL/TP
+// ============================================================================
+if fireLong
+    slPrice = low - atr14 * 0.5
+    risk = close - slPrice
+    tpPrice = close + risk * rrTarget
+    label.new(bar_index, low - atr14 * 0.3, "✅ LONG ENTRY (fired now)\nStop Loss: " + str.tostring(slPrice, format.mintick) + "\nTake Profit: " + str.tostring(tpPrice, format.mintick), style=label.style_label_up, color=color.new(color.green, 65), textcolor=color.white, size=size.small)
+
+if fireShort
+    slPrice = high + atr14 * 0.5
+    risk = slPrice - close
+    tpPrice = close - risk * rrTarget
+    label.new(bar_index, high + atr14 * 0.3, "🔻 SHORT ENTRY (fired now)\nStop Loss: " + str.tostring(slPrice, format.mintick) + "\nTake Profit: " + str.tostring(tpPrice, format.mintick), style=label.style_label_down, color=color.new(color.red, 65), textcolor=color.white, size=size.small)
+
+// ============================================================================
+// PLOT SETUP READY LABELS (Pending Entries)
+// ============================================================================
+if showSetupLabels and fireSetupLong
+    label.new(bar_index, low - atr14 * 0.5, "⏳ LONG SETUP READY\nWait for price to tap green/blue zone", style=label.style_label_up, color=color.new(color.yellow, 70), textcolor=color.black, size=size.small)
+
+if showSetupLabels and fireSetupShort
+    label.new(bar_index, high + atr14 * 0.5, "⏳ SHORT SETUP READY\nWait for price to tap red/pink zone", style=label.style_label_down, color=color.new(color.yellow, 70), textcolor=color.black, size=size.small)
+
+// ============================================================================
+// TRADE MONITORING / INVALIDATION
+// ============================================================================
+g_monitor = "Trade Monitor"
+stallBars = input.int(10, "Momentum stall window (bars, no new favorable high/low)", minval=3, group=g_monitor)
+
+var bool inLongTrade  = false
+var bool inShortTrade = false
+var float activeEntry = na
+var float activeSL    = na
+var float activeTP    = na
+var float bestSinceEntry = na
+var int   barsSinceEntry = 0
+
+if fireLong and not inLongTrade
+    inLongTrade := true
+    inShortTrade := false
+    activeEntry := close
+    activeSL := low - atr14 * 0.5
+    activeTP := close + (close - (low - atr14 * 0.5)) * rrTarget
+    bestSinceEntry := high
+    barsSinceEntry := 0
+
+if fireShort and not inShortTrade
+    inShortTrade := true
+    inLongTrade := false
+    activeEntry := close
+    activeSL := high + atr14 * 0.5
+    activeTP := close - ((high + atr14 * 0.5) - close) * rrTarget
+    bestSinceEntry := low
+    barsSinceEntry := 0
+
+if inLongTrade
+    barsSinceEntry += 1
+    bestSinceEntry := math.max(bestSinceEntry, high)
+
+if inShortTrade
+    barsSinceEntry += 1
+    bestSinceEntry := math.min(bestSinceEntry, low)
+
+longInvalid_choch     = inLongTrade and chochDown
+longInvalid_failedPOI = inLongTrade and close < activeEntry and close < (not na(lastSwingLow) ? lastSwingLow : activeEntry)
+longInvalid_stall      = inLongTrade and barsSinceEntry >= stallBars and bestSinceEntry <= high[stallBars]
+longInvalid = longInvalid_choch or longInvalid_failedPOI or longInvalid_stall
+
+shortInvalid_choch     = inShortTrade and chochUp
+shortInvalid_failedPOI = inShortTrade and close > activeEntry and close > (not na(lastSwingHigh) ? lastSwingHigh : activeEntry)
+shortInvalid_stall      = inShortTrade and barsSinceEntry >= stallBars and bestSinceEntry >= low[stallBars]
+shortInvalid = shortInvalid_choch or shortInvalid_failedPOI or shortInvalid_stall
+
+longHitSLTP  = inLongTrade and (low <= activeSL or high >= activeTP)
+shortHitSLTP = inShortTrade and (high >= activeSL or low <= activeTP)
+
+invalidateLongFire  = longInvalid and inLongTrade
+invalidateShortFire = shortInvalid and inShortTrade
+
+if invalidateLongFire or longHitSLTP
+    label.new(bar_index, low - atr14 * 0.6, longHitSLTP ? "🏁 Trade closed (hit SL or TP)" : "⚠ WARNING: long setup breaking down\nConsider closing this trade", style=label.style_label_up, color=color.new(longHitSLTP ? color.gray : color.yellow, 65), textcolor=color.black, size=size.small)
+    inLongTrade := false
+
+if invalidateShortFire or shortHitSLTP
+    label.new(bar_index, high + atr14 * 0.6, shortHitSLTP ? "🏁 Trade closed (hit SL or TP)" : "⚠ WARNING: short setup breaking down\nConsider closing this trade", style=label.style_label_down, color=color.new(shortHitSLTP ? color.gray : color.yellow, 65), textcolor=color.black, size=size.small)
+    inShortTrade := false
+
+// ============================================================================
+// PLAIN-ENGLISH STATUS
+// ============================================================================
+nearestZonePrice(tops, bots) =>
+    float best = na
+    if array.size(tops) > 0
+        for i = 0 to array.size(tops) - 1
+            float mid = (array.get(tops, i) + array.get(bots, i)) / 2
+            if na(best) or math.abs(mid - close) < math.abs(best - close)
+                best := mid
+    best
+
+nearestBullZone = nearestZonePrice(bullOBTop, bullOBBot)
+nearestBullZoneFVG = nearestZonePrice(bullFVGTop, bullFVGBot)
+nearestBearZone = nearestZonePrice(bearOBTop, bearOBBot)
+nearestBearZoneFVG = nearestZonePrice(bearFVGTop, bearFVGBot)
+
+string plainStatus = "No active setup"
+color plainColor = color.gray
+if inLongTrade
+    plainStatus := "✅ IN A LONG TRADE — managing it"
+    plainColor := color.lime
+else if inShortTrade
+    plainStatus := "🔻 IN A SHORT TRADE — managing it"
+    plainColor := color.red
+else if setupLongReady
+    plainStatus := "⏳ LONG SETUP READY — waiting for zone tap"
+    plainColor := color.yellow
+else if setupShortReady
+    plainStatus := "⏳ SHORT SETUP READY — waiting for zone tap"
+    plainColor := color.yellow
+else if htfOKLong and structOKLong and not poiLong
+    plainStatus := "👀 WATCHING for LONG — wait for price to reach the green zone"
+    plainColor := color.orange
+else if htfOKShort and structOKShort and not poiShort
+    plainStatus := "👀 WATCHING for SHORT — wait for price to reach the red zone"
+    plainColor := color.orange
+else
+    plainStatus := "⏳ No setup yet — bias/structure not aligned"
+    plainColor := color.gray
+
+// ============================================================================
+// STATUS TABLE
+// ============================================================================
+showTable = input.bool(true, "Show status table", group=g_vol)
+var table statusTable = table.new(position.top_right, 2, 8, bgcolor=color.new(color.black, 70), border_width=1)
+if showTable and barstate.islast
+    table.cell(statusTable, 0, 0, "WHAT'S HAPPENING", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 0, plainStatus, text_color=plainColor, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 1, "Daily Bias", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 1, htfBias == 1 ? "Bull" : htfBias == -1 ? "Bear" : "Flat", text_color=htfBias == 1 ? color.lime : htfBias == -1 ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 2, "4H Bias", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 2, midBias == 1 ? "Bull" : midBias == -1 ? "Bear" : "Flat", text_color=midBias == 1 ? color.lime : midBias == -1 ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 3, "Vol Regime", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 3, volRegimeOK ? "OK" : "Filtered", text_color=volRegimeOK ? color.lime : color.orange, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 4, "Zone", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 4, inDiscount ? "Discount" : "Premium", text_color=inDiscount ? color.lime : color.red, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 5, "ATR% Ratio", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 5, str.tostring(atrPctRatio, "#.#") + "%", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 6, "Active Trade", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 6, inLongTrade ? "LONG (" + str.tostring(barsSinceEntry) + "b)" : inShortTrade ? "SHORT (" + str.tostring(barsSinceEntry) + "b)" : "None", text_color=inLongTrade ? color.lime : inShortTrade ? color.red : color.gray, text_size=size.tiny)
+    
+    table.cell(statusTable, 0, 7, "Nearest Zone", text_color=color.white, text_size=size.tiny)
+    table.cell(statusTable, 1, 7, (not na(nearestBullZone) ? "Buy ~" + str.tostring(nearestBullZone, format.mintick) : "") + (not na(nearestBearZone) ? "  Sell ~" + str.tostring(nearestBearZone, format.mintick) : ""), text_color=color.white, text_size=size.tiny)
+
+// ============================================================================
+// LEGEND
+// ============================================================================
+showLegend = input.bool(true, "Show legend (explains every symbol)", group=g_vol)
+var table legend = table.new(position.bottom_left, 2, 9, bgcolor=color.new(color.black, 70), border_width=1)
+if showLegend and barstate.islast
+    table.cell(legend, 0, 0, "LEGEND", text_color=color.white, text_size=size.tiny)
+    table.cell(legend, 1, 0, "", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 1, "▲ BOS", text_color=color.lime, text_size=size.tiny)
+    table.cell(legend, 1, 1, "Trend continuing", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 2, "▲ CHoCH", text_color=color.aqua, text_size=size.tiny)
+    table.cell(legend, 1, 2, "Possible reversal", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 3, "✕ Sweep", text_color=color.orange, text_size=size.tiny)
+    table.cell(legend, 1, 3, "Stop-hunt, then reverse", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 4, "Green/Red box", text_color=color.lime, text_size=size.tiny)
+    table.cell(legend, 1, 4, "Order Block zones", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 5, "Blue/Pink box", text_color=color.blue, text_size=size.tiny)
+    table.cell(legend, 1, 5, "Fair Value Gap zones", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 6, "⏳ SETUP READY", text_color=color.yellow, text_size=size.tiny)
+    table.cell(legend, 1, 6, "Pending entry - wait for tap", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 7, "✅ LONG / 🔻 SHORT", text_color=color.white, text_size=size.tiny)
+    table.cell(legend, 1, 7, "Entry already fired", text_color=color.white, text_size=size.tiny)
+    
+    table.cell(legend, 0, 8, "⚠ Warning", text_color=color.yellow, text_size=size.tiny)
+    table.cell(legend, 1, 8, "Trade may be failing", text_color=color.white, text_size=size.tiny)
+
+// ============================================================================
+// ALERTS
+// ============================================================================
+alertcondition(fireLong,  title="SMC Long Entry",  message="Long entry signal: HTF bias + discount + CHoCH/BOS + POI confluence")
+alertcondition(fireShort, title="SMC Short Entry", message="Short entry signal: HTF bias + premium + CHoCH/BOS + POI confluence")
+alertcondition(fireSetupLong,  title="Long Setup Ready",  message="⏳ Long setup ready - waiting for price to tap the zone")
+alertcondition(fireSetupShort, title="Short Setup Ready", message="⏳ Short setup ready - waiting for price to tap the zone")
+alertcondition(invalidateLongFire,  title="Long Trade Invalidated",  message="⚠ Long trade looks invalidated — CHoCH against you, failed retest, or stalled momentum. Consider closing.")
+alertcondition(invalidateShortFire, title="Short Trade Invalidated", message="⚠ Short trade looks invalidated — CHoCH against you, failed retest, or stalled momentum. Consider closing.")
